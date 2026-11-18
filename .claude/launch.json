@@ -1,0 +1,60 @@
+﻿{
+    "version":  "0.0.1",
+    "configurations":  [
+                           {
+                               "name":  "khazeen-app-web",
+                               "runtimeExecutable":  "flutter",
+                               "runtimeArgs":  [
+                                                   "run",
+                                                   "-d",
+                                                   "web-server",
+                                                   "--web-port",
+                                                   "8085",
+                                                   "--web-hostname",
+                                                   "localhost",
+                                                   "--dart-define=AUTH_TEST_MODE=true"
+                                               ],
+                               "port":  8085
+                           },
+                           {
+                               "name":  "demo-merchant",
+                               "runtimeExecutable":  "flutter",
+                               "runtimeArgs":  [
+                                                   "run",
+                                                   "-d",
+                                                   "web-server",
+                                                   "--release",
+                                                   "--web-port",
+                                                   "8095",
+                                                   "--web-hostname",
+                                                   "localhost",
+                                                   "--dart-define-from-file=demo/demo.env.json"
+                                               ],
+                               "port":  8095
+                           },
+                           {
+                               "name":  "demo-company",
+                               "runtimeExecutable":  "powershell",
+                               "runtimeArgs":  [
+                                                   "-NoProfile",
+                                                   "-Command",
+                                                   "Set-Location -LiteralPath \u0027C:\\Users\\kirol\\OneDrive\\Desktop\\Khazeen Web\u0027; flutter run -d web-server --release --web-port 8096 --web-hostname localhost \u0027--dart-define-from-file=C:\\Users\\kirol\\OneDrive\\Desktop\\khazeen_app\\demo\\demo.env.json\u0027"
+                                               ],
+                               "port":  8096
+                           },
+                           {
+                               "name":  "demo-studio",
+                               "runtimeExecutable":  "python",
+                               "runtimeArgs":  [
+                                                   "-m",
+                                                   "http.server",
+                                                   "8097",
+                                                   "--bind",
+                                                   "127.0.0.1",
+                                                   "--directory",
+                                                   "demo/studio"
+                                               ],
+                               "port":  8097
+                           }
+                       ]
+}

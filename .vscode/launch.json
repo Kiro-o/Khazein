@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Khazeen (Chrome - Port 8080)",
+      "request": "launch",
+      "type": "dart",
+      "args": [
+        "-d",
+        "chrome",
+        "--web-port=8080"
+      ]
+    },
+    {
+      "name": "Khazeen (Edge - Port 8080)",
+      "request": "launch",
+      "type": "dart",
+      "args": [
+        "-d",
+        "edge",
+        "--web-port=8080"
+      ]
+    }
+  ]
+}

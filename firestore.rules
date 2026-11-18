@@ -1,0 +1,610 @@
+rules_version = '2';
+
+// ===============================================================
+// Khazeen (خزين) - shared Firestore rules for:
+//   - the merchant mobile app (khazeen_app): phone OTP sign-in
+//   - the supplier web dashboard (khazeen_web): email/password sign-in
+// Admin scripts (firebase-admin) and the Firebase console bypass these rules;
+// that is how suppliers are approved (status 'pending' -> 'active').
+// ===============================================================
+//
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users (merchants only)
+// Document ID: Firebase Auth uid
+// Fields (all written once at registration, no client updates):
+//   - uid: string (required, == doc id)
+//   - role: string (required, always 'merchant')
+//   - business_name: string (required, 1-120)
+//   - owner_name: string (required, 1-120)
+//   - phone_number: string (required, == auth token phone number, E.164)
+//   - store_category, governorate, city: string (required, 1-80)
+//   - address: string (required, 1-300)
+//   - landmark: string|null (optional, <= 200)
+//   - commercial_register: string|null (optional, <= 40)
+//   - latitude, longitude: number|null (optional)
+//   - exterior_photo_url, interior_photo_url: string (optional, Firebase
+//     Storage download URL under users/{uid}/store/)
+//   - created_at: timestamp (required, server time)
+//
+// Collection: suppliers (supplier web app)
+// Document ID: Firebase Auth uid
+// Fields (created at sign-up, changed only by admins):
+//   - uid: string (== doc id)
+//   - company_name: string (2-120)
+//   - email: string (== auth token email)
+//   - phone: string (<= 20, may be empty)
+//   - supplier_code: string (== counters/suppliers_counter.last_code)
+//   - username: string ('<name>-<supplier_code>', == a usernames doc id)
+//   - tax_id: string (<= 40, may be empty)
+//   - status: string ('pending' at sign-up; 'active' | 'suspended' by admins)
+//   - created_at: timestamp (server time)
+//
+// Subcollection: suppliers/{uid}/settings/store_config
+// Fields: store_name, tax_id, contact_phone, support_email,
+//   warehouse_address, currency, language, refresh_rate: string;
+//   low_stock_threshold, default_min_order_qty: int;
+//   auto_low_stock_alerts, auto_hide_out_of_stock, allow_backorders,
+//   is_dark_mode, compact_table_rows: bool;
+//   updated_at: timestamp (server time); updated_by: string (== auth email)
+//
+// Collection: usernames (username -> email lookup for supplier login)
+// Document ID: supplier username (lowercase)
+// Fields (created once at supplier sign-up, immutable):
+//   - uid: string (== auth uid of the supplier)
+//   - email: string (== auth token email)
+//
+// Collection: counters
+//   - orders_counter: { last_number: int, updated_at: timestamp }
+//     +1 per checkout, in the same transaction as orders/KZ-<n>-<i>.
+//   - suppliers_counter: { last_code: int, updated_at: timestamp }
+//     +1 per supplier sign-up, in the same transaction as suppliers/{uid}.
+//
+// Collection: products
+// Document ID: auto id (seed products use fixed ids)
+// Fields:
+//   - name: string (1-150), category: string (1-100)
+//   - carton_price: number (> 0), piece_price: number (>= 0)
+//   - units_per_carton: int (1-10000), min_order_qty: int (1-10000)
+//   - is_available: bool
+//   - supplier_uid: string (== owner uid, immutable)
+//   - supplier_code: string (== suppliers/{owner}.supplier_code)
+//   - supplier_name: string (== suppliers/{owner}.company_name; copied here
+//     so merchants never read the private suppliers doc)
+//   - image_url: string ('' or https URL, <= 2048)
+//   - stock_quantity: int (optional, >= 0)
+//   - created_at: timestamp (optional), updated_at: timestamp (server time)
+//
+// Collection: orders (one doc per supplier sub-order)
+// Document ID: 'KZ-<order_number>-<index>'
+// Fields (written by the merchant app at checkout):
+//   - id: string (== doc id), master_order_id: string ('KZ-<order_number>')
+//   - order_number: int (== counters/orders_counter.last_number after write)
+//   - merchant_id: string (== merchant uid, immutable)
+//   - merchant_name: string (== users/{merchant}.business_name)
+//   - merchant_phone: string (== auth token phone number, E.164)
+//   - delivery_address: string (1-500), delivery_notes: string (<= 500)
+//   - supplier_uid: string (an active supplier), supplier_code: string
+//     (== that supplier's code), supplier_name: string (<= 150)
+//   - delivery_sla: string (<= 100)
+//   - items: list (1-25) of maps { product_id, product_name, image_url,
+//     cartons_qty, carton_price, units_per_carton, line_total }. Only the
+//     list size is enforced here (see isValidOrder); item prices are not
+//     checked against products, so suppliers must review orders.
+//   - cartons_count: int > 0, subtotal: number >= 0, delivery_fee: 0,
+//     total: number (== subtotal)
+//   - status: 'pending' | 'processing' | 'out_for_delivery' | 'delivered'
+//     | 'cancelled' (created as 'pending'; changed only by the supplier)
+//   - payment_method: 'cash_on_delivery' | 'deferred'
+//   - created_at, updated_at: timestamp (server time)
+//
+// Collection: transactions (supplier ledger, supplier web app)
+// Fields: id: string (<= 32), supplier_uid: string (== owner uid),
+//   order_ref: string (<= 64), client: string (<= 150),
+//   method: 'Bank Transfer' | 'Cash on Delivery' | 'Wallet' | 'Credit',
+//   amount: number (0 - 1e9), is_inflow: bool,
+//   status: 'Completed' | 'Pending' | 'Failed',
+//   created_at: string (ISO date, <= 40), updated_at: timestamp (server time)
+//
+// Every path not matched below (e.g. categories) is denied.
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function signInProvider() {
+      return request.auth.token.firebase.sign_in_provider;
+    }
+
+    function docPath(coll, id) {
+      return /databases/$(database)/documents/$(coll)/$(id);
+    }
+
+    // A merchant has finished registration (users/{uid} with role merchant).
+    function isMerchant() {
+      return isAuthenticated() &&
+        get(docPath('users', request.auth.uid)).data.role == 'merchant';
+    }
+
+    function supplierDoc(uid) {
+      return get(docPath('suppliers', uid));
+    }
+
+    // An approved supplier. Pending and suspended suppliers cannot write.
+    function isActiveSupplier() {
+      return isAuthenticated() &&
+        supplierDoc(request.auth.uid).data.status == 'active';
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function changedOnly(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    function isString(value, minLen, maxLen) {
+      return value is string && value.size() >= minLen && value.size() <= maxLen;
+    }
+
+    function isOptionalString(data, field, maxLen) {
+      return !(field in data) || data[field] == null || isString(data[field], 0, maxLen);
+    }
+
+    function isOptionalNumber(data, field) {
+      return !(field in data) || data[field] == null || data[field] is number;
+    }
+
+    function isIntInRange(value, minValue, maxValue) {
+      return value is int && value >= minValue && value <= maxValue;
+    }
+
+    function isImageUrl(url) {
+      return url is string && url.size() <= 2048 &&
+        (url == '' || url.matches('https://.+'));
+    }
+
+    // A store photo link must point into the merchant's own Storage folder
+    // (users/{uid}/store/), not to any URL.
+    function isOwnStorePhoto(data, field, userId) {
+      return !(field in data) ||
+        (data[field] is string && data[field].size() <= 2048 &&
+          data[field].matches('https://firebasestorage[.]googleapis[.]com/v0/b/[^/]+/o/users%2F' +
+            userId + '%2Fstore%2F[^/?]+[?].*'));
+    }
+
+    function isServerTime(value) {
+      return value is timestamp && value == request.time;
+    }
+
+    // ===============================================================
+    // Domain Validators (used on both create and update)
+    // ===============================================================
+
+    function isValidMerchant(data, userId) {
+      return data.keys().hasOnly(['uid', 'role', 'business_name', 'owner_name',
+          'phone_number', 'store_category', 'governorate', 'city', 'address',
+          'landmark', 'commercial_register', 'latitude', 'longitude',
+          'exterior_photo_url', 'interior_photo_url', 'created_at']) &&
+        data.keys().hasAll(['uid', 'role', 'business_name', 'owner_name',
+          'phone_number', 'store_category', 'governorate', 'city', 'address',
+          'created_at']) &&
+        data.uid == userId &&
+        data.role == 'merchant' &&
+        isString(data.business_name, 1, 120) &&
+        isString(data.owner_name, 1, 120) &&
+        data.phone_number == request.auth.token.phone_number &&
+        isString(data.store_category, 1, 80) &&
+        isString(data.governorate, 1, 80) &&
+        isString(data.city, 1, 80) &&
+        isString(data.address, 1, 300) &&
+        isOptionalString(data, 'landmark', 200) &&
+        isOptionalString(data, 'commercial_register', 40) &&
+        isOptionalNumber(data, 'latitude') &&
+        isOptionalNumber(data, 'longitude') &&
+        isOwnStorePhoto(data, 'exterior_photo_url', userId) &&
+        isOwnStorePhoto(data, 'interior_photo_url', userId) &&
+        (data.get('latitude', null) == null ||
+          (data.latitude >= -90 && data.latitude <= 90)) &&
+        (data.get('longitude', null) == null ||
+          (data.longitude >= -180 && data.longitude <= 180)) &&
+        data.created_at is timestamp;
+    }
+
+    function isValidSupplier(data, supplierId) {
+      return data.keys().hasOnly(['uid', 'company_name', 'email', 'phone',
+          'supplier_code', 'username', 'tax_id', 'status', 'created_at']) &&
+        data.keys().hasAll(['uid', 'company_name', 'email', 'phone',
+          'supplier_code', 'username', 'tax_id', 'status', 'created_at']) &&
+        data.uid == supplierId &&
+        isString(data.company_name, 2, 120) &&
+        data.email == request.auth.token.email &&
+        isString(data.phone, 0, 20) &&
+        isString(data.supplier_code, 1, 10) &&
+        isString(data.username, 3, 100) &&
+        data.username.matches('.+-' + data.supplier_code) &&
+        isString(data.tax_id, 0, 40) &&
+        data.status in ['pending', 'active', 'suspended'] &&
+        data.created_at is timestamp;
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasOnly(['store_name', 'tax_id', 'contact_phone',
+          'support_email', 'warehouse_address', 'currency',
+          'low_stock_threshold', 'default_min_order_qty',
+          'auto_low_stock_alerts', 'auto_hide_out_of_stock',
+          'allow_backorders', 'is_dark_mode', 'language',
+          'compact_table_rows', 'refresh_rate', 'updated_at', 'updated_by']) &&
+        isOptionalString(data, 'store_name', 120) &&
+        isOptionalString(data, 'tax_id', 40) &&
+        isOptionalString(data, 'contact_phone', 20) &&
+        isOptionalString(data, 'support_email', 120) &&
+        isOptionalString(data, 'warehouse_address', 300) &&
+        isOptionalString(data, 'currency', 10) &&
+        isOptionalString(data, 'language', 20) &&
+        isOptionalString(data, 'refresh_rate', 40) &&
+        (!('low_stock_threshold' in data) ||
+          isIntInRange(data.low_stock_threshold, 0, 1000000)) &&
+        (!('default_min_order_qty' in data) ||
+          isIntInRange(data.default_min_order_qty, 0, 1000000)) &&
+        (!('auto_low_stock_alerts' in data) || data.auto_low_stock_alerts is bool) &&
+        (!('auto_hide_out_of_stock' in data) || data.auto_hide_out_of_stock is bool) &&
+        (!('allow_backorders' in data) || data.allow_backorders is bool) &&
+        (!('is_dark_mode' in data) || data.is_dark_mode is bool) &&
+        (!('compact_table_rows' in data) || data.compact_table_rows is bool) &&
+        isServerTime(data.updated_at) &&
+        data.updated_by == request.auth.token.email;
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasOnly(['name', 'category', 'carton_price',
+          'units_per_carton', 'piece_price', 'min_order_qty', 'is_available',
+          'supplier_code', 'supplier_uid', 'supplier_name', 'image_url',
+          'stock_quantity', 'created_at', 'updated_at']) &&
+        data.keys().hasAll(['name', 'category', 'carton_price',
+          'units_per_carton', 'piece_price', 'min_order_qty', 'is_available',
+          'supplier_code', 'supplier_uid', 'supplier_name', 'image_url',
+          'updated_at']) &&
+        isString(data.name, 1, 150) &&
+        isString(data.category, 1, 100) &&
+        data.carton_price is number &&
+        data.carton_price > 0 && data.carton_price <= 10000000 &&
+        isIntInRange(data.units_per_carton, 1, 10000) &&
+        data.piece_price is number &&
+        data.piece_price >= 0 && data.piece_price <= 10000000 &&
+        isIntInRange(data.min_order_qty, 1, 10000) &&
+        data.is_available is bool &&
+        isString(data.supplier_uid, 1, 128) &&
+        isString(data.supplier_code, 1, 10) &&
+        isString(data.supplier_name, 1, 120) &&
+        isImageUrl(data.image_url) &&
+        (!('stock_quantity' in data) ||
+          isIntInRange(data.stock_quantity, 0, 100000000)) &&
+        (!('created_at' in data) || data.created_at is timestamp) &&
+        isServerTime(data.updated_at);
+    }
+
+    function isValidOrderStatus(status) {
+      return status in ['pending', 'processing', 'out_for_delivery',
+        'delivered', 'cancelled'];
+    }
+
+    function isValidOrder(data, orderId) {
+      return data.keys().hasOnly(['id', 'master_order_id', 'order_number',
+          'merchant_id', 'merchant_name', 'merchant_phone', 'delivery_address',
+          'delivery_notes', 'supplier_uid', 'supplier_code', 'supplier_name',
+          'delivery_sla', 'items', 'cartons_count', 'subtotal', 'delivery_fee',
+          'total', 'status', 'payment_method', 'created_at', 'updated_at']) &&
+        data.keys().hasAll(['id', 'master_order_id', 'order_number',
+          'merchant_id', 'merchant_name', 'merchant_phone', 'delivery_address',
+          'delivery_notes', 'supplier_uid', 'supplier_code', 'supplier_name',
+          'delivery_sla', 'items', 'cartons_count', 'subtotal', 'delivery_fee',
+          'total', 'status', 'payment_method', 'created_at', 'updated_at']) &&
+        data.id == orderId &&
+        isIntInRange(data.order_number, 1001, 999999999) &&
+        data.master_order_id == 'KZ-' + string(data.order_number) &&
+        orderId.matches(data.master_order_id + '-[0-9]{1,2}') &&
+        isString(data.merchant_id, 1, 128) &&
+        isString(data.merchant_name, 1, 120) &&
+        isString(data.merchant_phone, 0, 20) &&
+        isString(data.delivery_address, 1, 500) &&
+        isString(data.delivery_notes, 0, 500) &&
+        isString(data.supplier_uid, 1, 128) &&
+        isString(data.supplier_code, 1, 10) &&
+        isString(data.supplier_name, 0, 150) &&
+        isString(data.delivery_sla, 0, 100) &&
+        // Items are not checked one by one: rules have no loops, and unrolled
+        // per-item checks exceed the 1000-expression limit for ~6 items
+        // (measured on the emulator). Firestore's 1 MB doc limit bounds them.
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 25 &&
+        isIntInRange(data.cartons_count, 1, 10000000) &&
+        data.subtotal is number && data.subtotal >= 0 &&
+        data.delivery_fee == 0 &&
+        data.total == data.subtotal &&
+        isValidOrderStatus(data.status) &&
+        data.payment_method in ['cash_on_delivery', 'deferred'] &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    // Suppliers can move an open order forward, cancel it, or correct a step
+    // (e.g. out_for_delivery -> processing). Delivered and cancelled orders
+    // are final, and nothing goes back to pending.
+    function isValidStatusChange(fromStatus, toStatus) {
+      return fromStatus in ['pending', 'processing', 'out_for_delivery'] &&
+        toStatus in ['processing', 'out_for_delivery', 'delivered', 'cancelled'] &&
+        toStatus != fromStatus;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasOnly(['id', 'supplier_uid', 'order_ref', 'client',
+          'method', 'amount', 'is_inflow', 'status', 'created_at',
+          'updated_at']) &&
+        data.keys().hasAll(['id', 'supplier_uid', 'order_ref', 'client',
+          'method', 'amount', 'is_inflow', 'status', 'created_at',
+          'updated_at']) &&
+        isString(data.id, 1, 32) &&
+        isString(data.order_ref, 0, 64) &&
+        isString(data.client, 0, 150) &&
+        data.method in ['Bank Transfer', 'Cash on Delivery', 'Wallet', 'Credit'] &&
+        data.amount is number && data.amount >= 0 && data.amount <= 1000000000 &&
+        data.is_inflow is bool &&
+        data.status in ['Completed', 'Pending', 'Failed'] &&
+        isString(data.created_at, 1, 40) &&
+        isServerTime(data.updated_at);
+    }
+
+    // ===============================================================
+    // users: merchant profiles (owner only)
+    // ===============================================================
+    match /users/{userId} {
+      // Contains the merchant's phone and address: owner only.
+      allow read: if isOwner(userId);
+
+      // Only phone-OTP accounts can become merchants, with their own verified
+      // number. role is fixed to 'merchant' by isValidMerchant.
+      allow create: if isOwner(userId) &&
+        signInProvider() == 'phone' &&
+        isValidMerchant(request.resource.data, userId) &&
+        isServerTime(request.resource.data.created_at);
+
+      // The app has no profile editing yet; admins edit via the console.
+      allow update, delete: if false;
+    }
+
+    // ===============================================================
+    // suppliers: supplier profiles (owner only)
+    // ===============================================================
+    match /suppliers/{supplierId} {
+      // Contains email, phone and tax id: owner only. Merchants see the
+      // supplier name through products.supplier_name instead.
+      allow read: if isOwner(supplierId);
+
+      // Sign-up (one transaction with counters/suppliers_counter and
+      // usernames/{username}). Always starts as 'pending' with the next
+      // supplier code; only email/password accounts can be suppliers.
+      allow create: if isOwner(supplierId) &&
+        signInProvider() == 'password' &&
+        isValidSupplier(request.resource.data, supplierId) &&
+        request.resource.data.status == 'pending' &&
+        isServerTime(request.resource.data.created_at) &&
+        request.resource.data.supplier_code ==
+          string(getAfter(docPath('counters', 'suppliers_counter')).data.last_code) &&
+        getAfter(docPath('usernames', request.resource.data.username)).data.uid ==
+          request.auth.uid;
+
+      // Status (approval / suspension) and profile changes are admin-only.
+      allow update, delete: if false;
+
+      // Per-supplier dashboard settings.
+      match /settings/{settingsId} {
+        allow read: if isOwner(supplierId);
+
+        allow create, update: if isOwner(supplierId) &&
+          settingsId == 'store_config' &&
+          isActiveSupplier() &&
+          isValidSettings(request.resource.data);
+
+        allow delete: if false;
+      }
+    }
+
+    // ===============================================================
+    // usernames: username -> email lookup for supplier login
+    // ===============================================================
+    match /usernames/{username} {
+      // Read before sign-in (login by username), so it cannot require auth.
+      // Single-document get only: the collection cannot be listed. This
+      // exposes a supplier's login email to anyone who knows the username.
+      allow get: if true;
+      allow list: if false;
+
+      // Created once, in the sign-up transaction, for the caller's own
+      // supplier profile. Never changed afterwards (prevents takeover).
+      allow create: if isAuthenticated() &&
+        signInProvider() == 'password' &&
+        hasOnlyAllowedFields(['uid', 'email']) &&
+        hasRequiredFields(['uid', 'email']) &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.email == request.auth.token.email &&
+        username.size() <= 100 &&
+        getAfter(docPath('suppliers', request.auth.uid)).data.username == username;
+
+      allow update, delete: if false;
+    }
+
+    // ===============================================================
+    // counters: sequential order numbers and supplier codes
+    // ===============================================================
+    match /counters/orders_counter {
+      allow get: if isMerchant();
+      allow list: if false;
+
+      // +1 only, and only together with sub-order #1 of that checkout.
+      allow create: if isMerchant() &&
+        hasOnlyAllowedFields(['last_number', 'updated_at']) &&
+        request.resource.data.last_number == 1001 &&
+        isServerTime(request.resource.data.updated_at) &&
+        getAfter(docPath('orders', 'KZ-1001-1')).data.merchant_id == request.auth.uid;
+
+      allow update: if isMerchant() &&
+        hasOnlyAllowedFields(['last_number', 'updated_at']) &&
+        request.resource.data.last_number is int &&
+        request.resource.data.last_number == resource.data.last_number + 1 &&
+        isServerTime(request.resource.data.updated_at) &&
+        getAfter(docPath('orders',
+          'KZ-' + string(request.resource.data.last_number) + '-1')).data.merchant_id ==
+          request.auth.uid;
+
+      allow delete: if false;
+    }
+
+    match /counters/suppliers_counter {
+      // Read inside the sign-up transaction.
+      allow get: if isAuthenticated() && signInProvider() == 'password';
+      allow list: if false;
+
+      // +1 only, by a user who has no supplier profile yet and creates it in
+      // the same transaction with the new code.
+      allow create: if isAuthenticated() &&
+        signInProvider() == 'password' &&
+        hasOnlyAllowedFields(['last_code', 'updated_at']) &&
+        request.resource.data.last_code == 20 &&
+        isServerTime(request.resource.data.updated_at) &&
+        !exists(docPath('suppliers', request.auth.uid)) &&
+        getAfter(docPath('suppliers', request.auth.uid)).data.supplier_code == '20';
+
+      allow update: if isAuthenticated() &&
+        signInProvider() == 'password' &&
+        hasOnlyAllowedFields(['last_code', 'updated_at']) &&
+        request.resource.data.last_code is int &&
+        request.resource.data.last_code == resource.data.last_code + 1 &&
+        isServerTime(request.resource.data.updated_at) &&
+        !exists(docPath('suppliers', request.auth.uid)) &&
+        getAfter(docPath('suppliers', request.auth.uid)).data.supplier_code ==
+          string(request.resource.data.last_code);
+
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // products: catalog (merchants read, owning active supplier writes)
+    // ===============================================================
+    match /products/{productId} {
+      // Registered merchants browse the catalog (where is_available == true);
+      // a supplier reads its own products (where supplier_uid == uid).
+      allow read: if isMerchant() ||
+        (isAuthenticated() && resource.data.supplier_uid == request.auth.uid);
+
+      // supplier_code and supplier_name must match the supplier's profile.
+      allow create: if isActiveSupplier() &&
+        isValidProduct(request.resource.data) &&
+        request.resource.data.supplier_uid == request.auth.uid &&
+        request.resource.data.supplier_code ==
+          supplierDoc(request.auth.uid).data.supplier_code &&
+        request.resource.data.supplier_name ==
+          supplierDoc(request.auth.uid).data.company_name &&
+        (!('created_at' in request.resource.data) ||
+          isServerTime(request.resource.data.created_at));
+
+      // The owner cannot hand a product to another supplier; changed
+      // supplier_code / supplier_name must still match the profile.
+      allow update: if isActiveSupplier() &&
+        resource.data.supplier_uid == request.auth.uid &&
+        isValidProduct(request.resource.data) &&
+        request.resource.data.supplier_uid == resource.data.supplier_uid &&
+        (request.resource.data.supplier_code == resource.data.supplier_code ||
+          request.resource.data.supplier_code ==
+            supplierDoc(request.auth.uid).data.supplier_code) &&
+        (request.resource.data.supplier_name == resource.data.supplier_name ||
+          request.resource.data.supplier_name ==
+            supplierDoc(request.auth.uid).data.company_name) &&
+        (!('created_at' in resource.data) ||
+          request.resource.data.created_at == resource.data.created_at);
+
+      allow delete: if isActiveSupplier() &&
+        resource.data.supplier_uid == request.auth.uid;
+    }
+
+    // ===============================================================
+    // orders: supplier sub-orders
+    // ===============================================================
+    match /orders/{orderId} {
+      // The merchant who placed it (where merchant_id == uid) and the
+      // supplier it is addressed to (where supplier_uid == uid).
+      allow read: if isAuthenticated() &&
+        (resource.data.merchant_id == request.auth.uid ||
+          resource.data.supplier_uid == request.auth.uid);
+
+      // Checkout: a new 'pending' order for the caller, to an active
+      // supplier, numbered by the counter bump in the same transaction.
+      allow create: if isMerchant() &&
+        isValidOrder(request.resource.data, orderId) &&
+        request.resource.data.merchant_id == request.auth.uid &&
+        // The supplier calls this number: it must be the verified one.
+        request.resource.data.merchant_phone == request.auth.token.phone_number &&
+        request.resource.data.merchant_name ==
+          get(docPath('users', request.auth.uid)).data.business_name &&
+        request.resource.data.status == 'pending' &&
+        isServerTime(request.resource.data.created_at) &&
+        isServerTime(request.resource.data.updated_at) &&
+        supplierDoc(request.resource.data.supplier_uid).data.status == 'active' &&
+        supplierDoc(request.resource.data.supplier_uid).data.supplier_code ==
+          request.resource.data.supplier_code &&
+        getAfter(docPath('counters', 'orders_counter')).data.last_number ==
+          request.resource.data.order_number &&
+        // ...and that bump happens in this same request.
+        ((exists(docPath('counters', 'orders_counter')) &&
+          get(docPath('counters', 'orders_counter')).data.last_number ==
+            request.resource.data.order_number - 1) ||
+         (!exists(docPath('counters', 'orders_counter')) &&
+          request.resource.data.order_number == 1001));
+
+      // The supplier changes only the status (and updated_at).
+      allow update: if isActiveSupplier() &&
+        resource.data.supplier_uid == request.auth.uid &&
+        changedOnly(['status', 'updated_at']) &&
+        isValidOrderStatus(request.resource.data.status) &&
+        isValidStatusChange(resource.data.status, request.resource.data.status) &&
+        isServerTime(request.resource.data.updated_at);
+
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // transactions: supplier ledger (owner only)
+    // ===============================================================
+    match /transactions/{transactionId} {
+      allow read: if isAuthenticated() &&
+        resource.data.supplier_uid == request.auth.uid;
+
+      allow create: if isActiveSupplier() &&
+        isValidTransaction(request.resource.data) &&
+        request.resource.data.supplier_uid == request.auth.uid;
+
+      // The dashboard does not edit entries; corrections are new entries.
+      allow update: if false;
+
+      allow delete: if isActiveSupplier() &&
+        resource.data.supplier_uid == request.auth.uid;
+    }
+  }
+}

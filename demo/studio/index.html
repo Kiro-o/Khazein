@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>Khazeen Demo Studio</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;800&display=swap" rel="stylesheet">
+<style>
+  /* Recording stage for the demo video (1920x1080): the company dashboard
+     and the merchant phone side by side at their real size, with a caption
+     bar driven by the URL hash (#0, #1, ..., #cover, #end) so captions
+     change without reloading the apps. */
+  :root { --green: #138A52; --ink: #10231a; --bg: #eaf2ed; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); font-family: Cairo, sans-serif; }
+  .caption { height: 92px; display: flex; align-items: center; justify-content: space-between; padding: 0 48px; background: var(--green); color: #fff; }
+  .caption .step { font-size: 36px; font-weight: 800; }
+  .caption .brand { display: flex; align-items: center; gap: 12px; font-size: 24px; font-weight: 600; }
+  .caption .brand img { width: 46px; height: 46px; border-radius: 12px; background: #fff; padding: 4px; }
+  .stage { display: flex; gap: 40px; padding: 26px 40px 0; direction: ltr; }
+  .label { height: 34px; font-size: 18px; font-weight: 600; color: #4b6357; text-align: center; }
+  .desk .frame { width: 1386px; height: 900px; border-radius: 14px; overflow: hidden; background: #0f172a; box-shadow: 0 14px 40px rgba(16,35,26,.18); }
+  .desk .bar { height: 30px; background: #1f2937; display: flex; align-items: center; gap: 7px; padding: 0 12px; }
+  .desk .bar i { width: 11px; height: 11px; border-radius: 50%; background: #4b5563; display: block; }
+  .desk iframe { width: 1386px; height: 870px; border: 0; display: block; }
+  .phone .frame { width: 414px; height: 868px; border-radius: 46px; background: #111; padding: 12px; box-shadow: 0 14px 40px rgba(16,35,26,.25); }
+  .phone .screen { width: 390px; height: 844px; border-radius: 34px; overflow: hidden; background: #fff; }
+  .phone iframe { width: 390px; height: 844px; border: 0; display: block; }
+  .cover { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 22px; background: var(--green); color: #fff; z-index: 10; }
+  .cover img { width: 180px; height: 180px; border-radius: 40px; background: #fff; padding: 16px; }
+  .cover h1 { font-size: 80px; font-weight: 800; line-height: 1.1; }
+  .cover p { font-size: 34px; font-weight: 600; opacity: .92; }
+  .cover small { font-size: 22px; opacity: .75; margin-top: 8px; }
+  body.show-cover .cover { display: flex; }
+  /* Pointer drawn over the apps (headless recordings show no cursor). */
+  .cursor { position: fixed; left: 0; top: 0; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%;
+            background: rgba(19,138,82,.28); border: 3px solid #138A52; pointer-events: none; z-index: 20; opacity: 0;
+            transition: transform .45s cubic-bezier(.4,0,.2,1), opacity .2s; }
+  .cursor.tap { animation: tap .35s ease-out; }
+  @keyframes tap { 0% { box-shadow: 0 0 0 0 rgba(19,138,82,.55); } 100% { box-shadow: 0 0 0 22px rgba(19,138,82,0); } }
+</style>
+</head>
+<body>
+  <div class="caption"><div class="step" id="step"></div><div class="brand"><span>خزين</span><img src="logo.png" alt=""></div></div>
+  <div class="stage">
+    <div class="desk">
+      <div class="label">لوحة الشركة</div>
+      <div class="frame"><div class="bar"><i></i><i></i><i></i></div><iframe src="http://localhost:8096/" title="company"></iframe></div>
+    </div>
+    <div class="phone">
+      <div class="label">تطبيق التاجر</div>
+      <div class="frame"><div class="screen"><iframe src="http://localhost:8095/" title="merchant"></iframe></div></div>
+    </div>
+  </div>
+  <div class="cover"><img src="logo.png" alt=""><h1>خزين</h1><p id="coverText"></p><small id="coverSmall"></small></div>
+  <div class="cursor" id="cursor"></div>
+<script>
+  const steps = {
+    0: 'لوحة الشركة: الطلبات والإيرادات والمخزون في مكان واحد',
+    1: 'الشركة بتضيف منتج جديد',
+    2: 'المنتج يظهر عند التاجر فوراً',
+    3: 'التاجر يطلب كرتونتين في ثواني',
+    4: 'الطلب يوصل للشركة لحظياً',
+    5: 'الشركة تقبل… والتاجر يشوف الحالة تتغير قدامه',
+    6: 'المخزون اتخصم تلقائياً: 60 ← 58 كرتونة',
+  };
+  // Called by the recording script before each click.
+  const cursor = document.getElementById('cursor');
+  window.moveCursor = (x, y) => {
+    cursor.style.opacity = '1';
+    cursor.style.transform = `translate(${x}px, ${y}px)`;
+  };
+  window.tapCursor = () => {
+    cursor.classList.remove('tap');
+    void cursor.offsetWidth;
+    cursor.classList.add('tap');
+  };
+  const covers = {
+    cover: ['كل نواقص محلك بسعر الجملة', 'منصة B2B بين شركات التوزيع والمحلات'],
+    end: ['من الشركة للمحل… من غير وسيط', 'Flutter · Firebase · تحديث لحظي'],
+  };
+  function apply() {
+    const key = location.hash.slice(1) || '0';
+    const cover = covers[key];
+    document.body.classList.toggle('show-cover', Boolean(cover));
+    if (cover) {
+      document.getElementById('coverText').textContent = cover[0];
+      document.getElementById('coverSmall').textContent = cover[1];
+    }
+    document.getElementById('step').textContent = steps[key] || '';
+  }
+  addEventListener('hashchange', apply);
+  apply();
+</script>
+</body>
+</html>
